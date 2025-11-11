@@ -228,8 +228,8 @@ specialty_summary <- imds_data2 |>
   group_by(discharge_specialty) |>
   summarise(n = n(),
             mean_los = mean(mh_days, na.rm = T),
-            mean_no_nctr = mean(los_no_nctr, na.rm = T)) |>
-  mutate(mean_ctr = mean_los - mean_no_nctr)
+            mean_ctr = mean(los_no_nctr, na.rm = T)) |>
+  mutate(mean_nctr = mean_los - mean_ctr)
 
 
 specialty_activity <- specialty_summary |>
@@ -247,10 +247,17 @@ specialty_los <- specialty_summary |>
   mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
   mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
   filter(!discharge_specialty == "Other") |>
-  ggplot(aes(x = discharge_specialty, y = mean_los)) +
+  pivot_longer(
+    cols = c(mean_ctr, mean_nctr), 
+    names_to = "los_type", 
+    values_to = "los_value"
+  ) |>
+  mutate(los_type = factor(los_type, levels = c("mean_ctr", "mean_nctr"))) |>
+  ggplot(aes(x = discharge_specialty, y = los_value, fill = fct_rev(los_type))) +
   geom_col() +
   coord_flip() +
   labs(x = NULL,
-       y = "Mean LoS (Days)")
+       y = "Mean LoS (Days)",
+       fill = "LoS Type")
 
 specialty_activity + specialty_los
