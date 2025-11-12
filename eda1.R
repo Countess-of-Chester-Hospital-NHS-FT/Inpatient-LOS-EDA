@@ -11,7 +11,7 @@ theme_set(theme_bw())
 ### data import
 db <- DBI::dbConnect(odbc::odbc(), "coch_p2")
 imds_data <-  DBI::dbGetQuery(db, "
-  with last_epi as (
+ with last_epi as (
   select
 	  ENCNTR_ID
 	  ,luspec.Specialty as [DischargeSpecialty]
@@ -36,9 +36,17 @@ imds_data <-  DBI::dbGetQuery(db, "
   from CernerStaging.BI.IP_Ward_Stays
   where LocationName like '%EPH%'
   )
+
+  ,ed as (
+  select 
+  ENCNTR_ID
+  ,TrackingHours
+  from CernerStaging.[BI].[ECDS_Attendances]
+  )
   
   select
 	imds.ENCNTR_ID
+	,ed.TrackingHours
 	,ENCNTR_SLICE_ID
 	,LocalPatientIdentifier
 	,AdmissionDate
@@ -81,13 +89,14 @@ left join LoadRef.TRUD.ICD10 icd10 on icd10.ALT_CODE = imds.PrimaryDiagnosis COL
 left join last_epi on imds.ENCNTR_ID = last_epi.ENCNTR_ID
 left join nctr_first on nctr_first.ENCNTR_ID = imds.ENCNTR_ID
 left join eph_first on eph_first.ENCNTR_ID = imds.ENCNTR_ID and eph_first.RN = 1
+left join ed on ed.ENCNTR_ID = imds.ENCNTR_ID
 where 1=1
 	and EpisodeNumber = 1
-order by AdmissionDate desc                        
+order by AdmissionDate desc                  
                               ")
 
-saveRDS(imds_data, "data\\imds_data.rds")
-#imds_data <- readRDS("data\\imds_data.rds") for offline
+#saveRDS(imds_data, "data\\imds_data.rds")
+imds_data <- readRDS("data\\imds_data.rds") #for offline
 
 imds_data2 <- imds_data |>
   clean_names() |>
@@ -121,15 +130,24 @@ imds_summary <- imds_data2 |>
   group_by(admission_month) |>
   summarise(n = n(),
             incomplete = sum(not_discharged),
-            mean_los = mean(mh_days, na.rm = T)) |>
+            mean_los = mean(mh_days, na.rm = T),
+            mean_no_eph = mean(los_no_eph, na.rm = T),
+            mean_no_nctr = mean(los_no_nctr, na.rm = T),
+            mean_no_eph_nctr = mean(los_no_eph_nctr, na.rm = T)
+            ) |>
   ungroup() |>
   mutate(rolling_6mn_avg = zoo::rollmean(mean_los, k = 6, fill = NA, align = "right"),
-         rolling_adm_avg = zoo::rollmean(n, k = 6, fill = NA, align = "right"))
+         rolling_adm_avg = zoo::rollmean(n, k = 6, fill = NA, align = "right"),
+         rolling_no_eph = zoo::rollmean(mean_no_eph, k = 6, fill = NA, align = "right"),
+         rolling_no_nctr = zoo::rollmean(mean_no_nctr, k = 6, fill = NA, align = "right"),
+         rolling_no_eph_nctr = zoo::rollmean(mean_no_eph_nctr, k = 6, fill = NA, align = "right")
+         )
 
 # This is used to scale the secondary variable to the primary one
 transformation_ratio <- max(imds_summary$rolling_6mn_avg, na.rm = T) / max(imds_summary$incomplete, na.rm = T)
 
 ## Recreate MH plot - visualise missing data
+## This is only part of the missing data - people on first episode just won't appear
 imds_summary |>
   ggplot(aes(x = admission_month)) +
   geom_col(aes(y = incomplete * transformation_ratio),
@@ -167,6 +185,7 @@ plot_data <- imds_summary |> filter(admission_month <= max_month)
 
 los_model <- lm(mean_los ~ admission_month, data = plot_data)
 yearly_increase <- coef(los_model)["admission_month"] * 365 #convert coef from daily to monthly
+latest <- plot_data |> filter(admission_month == max_month) |> pull(rolling_6mn_avg)
 
 plot_data |>
   ggplot(aes(x = admission_month)) +
@@ -192,7 +211,75 @@ plot_data |>
   labs(x = NULL,
        y = "Mean LOS (Days)",
        title = "Mean Emergency Inpatient LOS (Rolling 6 months)",
-       subtitle = paste("Trend indicates increase of ", round(yearly_increase, 1), "days per year"))
+       subtitle = paste("Latest Mean: ", round(latest, 1),
+                        "Trend :", round(yearly_increase, 1), "days per year"))
+
+## LOS - No EPH
+los_model_eph <- lm(mean_no_eph ~ admission_month, data = plot_data)
+yearly_eph <- coef(los_model_eph)["admission_month"] * 365
+latest_no_eph <- plot_data |> filter(admission_month == max_month) |> pull(rolling_no_eph)
+
+plot_data |>
+  ggplot(aes(x = admission_month)) +
+  geom_line(aes(y = rolling_no_eph, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_no_eph), method = "lm") +
+  geom_line(aes(y = mean_no_eph, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_no_eph, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_no_eph, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean LOS (Days)",
+       title = "Mean Emergency Inpatient LOS - No EPH",
+       subtitle = paste("Latest Mean: ", round(latest_no_eph, 1),
+                        "Trend :", round(yearly_increase, 1), "days per year"))
+
+## LOS - No NCTR
+plot_data_nctr <- plot_data |> filter(admission_month >= ymd("20230401"))
+los_model_nctr <- lm(mean_no_nctr ~ admission_month, data = plot_data_nctr)
+yearly_nctr <- coef(los_model_nctr)["admission_month"] * 365
+latest_nctr <- plot_data |> filter(admission_month == max_month) |> pull(rolling_no_nctr)
+
+plot_data_nctr |>
+  ggplot(aes(x = admission_month)) +
+  geom_line(aes(y = rolling_no_nctr, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_no_nctr), method = "lm") +
+  geom_line(aes(y = mean_no_nctr, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_no_nctr, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_no_nctr, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean LOS (Days)",
+       title = "Mean Emergency Inpatient LOS - No NCTR",
+       subtitle = paste("Latest Mean: ", round(latest_nctr, 1),
+                        "Trend :", round(yearly_nctr, 1), "days per year"))
+
+
 
 ## Plot admission activity
 plot_data |>
@@ -260,4 +347,8 @@ specialty_los <- specialty_summary |>
        y = "Mean LoS (Days)",
        fill = "LoS Type")
 
-specialty_activity + specialty_los
+(specialty_activity + specialty_los) + plot_annotation(title = "Activity and LOS by Specialty")
+
+top_5_specs <- imds_data2 %>%
+  count(discharge_specialty, sort=T) %>%
+  slice(1:5)
