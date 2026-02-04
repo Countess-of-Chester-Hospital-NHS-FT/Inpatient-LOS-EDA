@@ -1,7 +1,7 @@
 # Exploratory Analysis of Inpatient Length of Stay
 
 ### Status
-This project is currently work in progress.
+This project is an analysis that is repeated on an adhoc basis.
 
 Unless otherwise specified the CODEOWNER has responsibility for maintaining the code and addressing any security concerns.
 
@@ -13,17 +13,12 @@ Note: No data are shared in this repo.
 ### Project Structure
 
 * The main code is found in the root of the repo
+* los.qmd is the primary code file containing the visuals that typically need repeating
+* eda1.R and eda2.R are untidy code files, remnants of development
 
-### Built with
-
-### Outputs
 
 
 ### Contributing
-Contributions and identification of issues are welcomed. Please raise any security concerns as an issue.
+Identification of issues and discussion are welcomed. Please raise any security concerns as an issue.
 
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/Feature`)
-3. Commit your Changes (`git commit -m 'Add some Feature'`)
-4. Push to the Branch (`git push origin feature/Feature`)
-5. Open a Pull Request
+
