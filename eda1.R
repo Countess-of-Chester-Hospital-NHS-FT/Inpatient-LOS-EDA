@@ -36,17 +36,9 @@ imds_data <-  DBI::dbGetQuery(db, "
   from CernerStaging.BI.IP_Ward_Stays
   where LocationName like '%EPH%'
   )
-
-  ,ed as (
-  select 
-  ENCNTR_ID
-  ,TrackingHours
-  from CernerStaging.[BI].[ECDS_Attendances]
-  )
   
   select
 	imds.ENCNTR_ID
-	,ed.TrackingHours
 	,ENCNTR_SLICE_ID
 	,LocalPatientIdentifier
 	,AdmissionDate
@@ -89,13 +81,24 @@ left join LoadRef.TRUD.ICD10 icd10 on icd10.ALT_CODE = imds.PrimaryDiagnosis COL
 left join last_epi on imds.ENCNTR_ID = last_epi.ENCNTR_ID
 left join nctr_first on nctr_first.ENCNTR_ID = imds.ENCNTR_ID
 left join eph_first on eph_first.ENCNTR_ID = imds.ENCNTR_ID and eph_first.RN = 1
-left join ed on ed.ENCNTR_ID = imds.ENCNTR_ID
 where 1=1
 	and EpisodeNumber = 1
 order by AdmissionDate desc                  
                               ")
 
+ed_data <-  DBI::dbGetQuery(db,
+                            "select 
+                            ENCNTR_ID
+                            ,TrackingHours
+                            ,CheckInDateTime
+                            ,CheckOutDateTime
+                            ,InpatientAdmitDateTime_Encounter
+                            ,Discharge_Destination_Mnemonic
+                            from CernerStaging.[BI].[ECDS_Attendances]"
+                            )
+
 #saveRDS(imds_data, "data\\imds_data.rds")
+#saveRDS(ed_data, "data\\ed_data.rds")
 imds_data <- readRDS("data\\imds_data.rds") #for offline
 
 imds_data2 <- imds_data |>

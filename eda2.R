@@ -6,6 +6,7 @@ library(zoo)
 library(slider)
 library(patchwork)
 library(scales)
+library(NHSRplotthedots)
 
 theme_set(theme_bw())
 
@@ -16,6 +17,7 @@ sdec_corridor_esc <- ymd("20250901")
 mh_max <- ymd("20250601")
 
 imds_data <- readRDS("data\\imds_data.rds")
+ed_data <- readRDS("data\\ed_data.rds") |> clean_names()
 
 imds_data2 <- imds_data |>
   clean_names() |>
@@ -43,7 +45,10 @@ imds_data2 <- imds_data |>
     discharge_date >= ymd("20210801"),
     discharge_date < floor_date(today(), "month"),
     #mh_days > 7
-    )
+    ) |>
+  left_join(ed_data, by = c("encntr_id"="encntr_id"))
+
+missing <- missing_glimpse(imds_data2)
 
 plot_data <- imds_data2 |>
   group_by(discharge_month) |>
@@ -53,7 +58,8 @@ plot_data <- imds_data2 |>
             mean_no_eph = mean(los_no_eph, na.rm = T),
             mean_ctr = mean(los_ctr, na.rm = T),
             mean_nctr = mean(los_nctr, na.rm = T),
-            mean_no_eph_nctr = mean(los_no_eph_nctr, na.rm = T)
+            mean_no_eph_nctr = mean(los_no_eph_nctr, na.rm = T),
+            mean_ed = mean(tracking_hours, na.rm = T)
   ) |>
   ungroup() |>
   mutate(rolling_6mn_avg = zoo::rollmean(mean_los, k = 6, fill = NA, align = "right"),
@@ -61,13 +67,16 @@ plot_data <- imds_data2 |>
          rolling_no_eph = zoo::rollmean(mean_no_eph, k = 6, fill = NA, align = "right"),
          rolling_ctr = zoo::rollmean(mean_ctr, k = 6, fill = NA, align = "right"),
          rolling_nctr = zoo::rollmean(mean_nctr, k = 6, fill = NA, align = "right"),
-         rolling_no_eph_nctr = zoo::rollmean(mean_no_eph_nctr, k = 6, fill = NA, align = "right")
+         rolling_no_eph_nctr = zoo::rollmean(mean_no_eph_nctr, k = 6, fill = NA, align = "right"),
+         rolling_ed = zoo::rollmean(mean_ed, k = 6, fill = NA, align = "right")
   )
+
+max_month <- max(plot_data$discharge_month)
 
 ## Recreate MH plot - trimmed + trend
 los_model <- lm(mean_los ~ discharge_month, data = plot_data)
 yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
-latest <- plot_data |> filter(discharge_month == max_month) |> pull(rolling_6mn_avg)
+latest <- plot_data |> filter(discharge_month == max(plot_data$discharge_month)) |> pull(rolling_6mn_avg)
 
 los_plot <- plot_data |>
   ggplot(aes(x = discharge_month)) +
@@ -118,12 +127,31 @@ los_plot <- plot_data |>
 
 los_plot
 
+## SPC
+plot_data |>
+  ptd_spc(
+    value_field = mean_los,
+    date_field = discharge_month,
+    improvement_direction = "decrease"
+  ) |>
+  ptd_create_ggplot(x_axis_label = NULL,
+       y_axis_label = "Mean LoS (Days)",
+       main_title = "Mean Emergency Inpatient LoS (Days)") +
+  #geom_rect(xmin = mh_max, xmax = max(plot_data$discharge_month), ymin = -Inf, ymax = Inf,
+            #fill = "gold", alpha = 0.01, inherit.aes = FALSE) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
 ## Plot CTR vs NCTR Los
 nctr_data <- plot_data |> filter(discharge_month >= ymd("20230401") )
 
 los_model <- lm(mean_ctr ~ discharge_month, data = nctr_data)
 yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
-latest <- nctr_data |> filter(discharge_month == max_month) |> pull(rolling_ctr)
+latest <- nctr_data |> filter(discharge_month == max(nctr_data$discharge_month)) |> pull(rolling_ctr)
 
 ctr_plot <- nctr_data |>
   ggplot(aes(x = discharge_month)) +
@@ -206,6 +234,131 @@ nctr_plot <- nctr_data |>
 nctr_plot
 
 (nctr_plot / ctr_plot)
+
+### Entrance block - For ED Patients Mean LoS
+
+los_model <- lm(mean_ed ~ discharge_month, data = plot_data)
+yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
+latest <- plot_data |> filter(discharge_month == max_month) |> pull(rolling_ed)
+
+ed_plot <- plot_data |>
+  ggplot(aes(x = discharge_month)) +
+  geom_rect(xmin = mh_max, xmax = max_month, ymin = -Inf, ymax = Inf,
+            fill = "gold", alpha = 0.01, inherit.aes = FALSE) +
+  
+  geom_line(aes(y = rolling_ed, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_ed), method = "lm") +
+  geom_line(aes(y = mean_ed, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_ed, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_ed, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean Admission Delay (Hours)",
+       title = "Mean Admission Delay (Rolling 6 months)",
+       subtitle = paste("Latest Mean: ", round(latest, 1),
+                        "Trend :", round(yearly_increase, 1), "hours per year"))
+
+ed_plot
+
+### Specialties and length of stay
+specialty_summary <- imds_data2 |>
+  filter(discharge_month <= max(plot_data$discharge_month),
+         discharge_month >= min(nctr_data$discharge_month)) |>
+  group_by(discharge_specialty) |>
+  summarise(n = n(),
+            mean_los = mean(mh_days, na.rm = T),
+            mean_ctr = mean(los_ctr, na.rm = T),
+            mean_ed = mean(tracking_hours, na.rm = T)) |>
+  mutate(mean_nctr = mean_los - mean_ctr) |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
+  filter(!discharge_specialty == "Other")
+
+
+specialty_activity <- specialty_summary |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |> 
+  filter(!discharge_specialty == "Other") |>
+  ggplot(aes(x = discharge_specialty, y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL)
+
+specialty_activity
+
+specialty_los <- specialty_summary |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
+  filter(!discharge_specialty == "Other") |>
+  pivot_longer(
+    cols = c(mean_ctr, mean_nctr), 
+    names_to = "los_type", 
+    values_to = "los_value"
+  ) |>
+  mutate(los_type = factor(los_type, levels = c("mean_ctr", "mean_nctr"))) |>
+  ggplot(aes(x = discharge_specialty, y = los_value, fill = fct_rev(los_type))) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Mean LoS (Days)",
+       fill = "LoS Type")
+
+specialty_los
+
+## specialty entrance block
+specialty_ed <- specialty_summary |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
+  filter(!discharge_specialty == "Other") |>
+  ggplot(aes(x = discharge_specialty, y = mean_ed)) +
+  geom_col() +
+  #geom_boxplot()+
+  coord_flip() +
+  labs(x = NULL,
+       y = "Mean Admission Delay (Hours)"
+       )
+
+specialty_ed
+
+## specialty ed boxplot - how to order the same as other plots
+specialty_ed2 <- imds_data2 |>
+  filter(discharge_specialty %in% specialty_summary$discharge_specialty,
+         tracking_hours < 200) |>
+  ggplot(aes(x = discharge_specialty, y = tracking_hours)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Mean Admission Delay (Hours)"
+  )
+
+specialty_ed2
+
+(specialty_activity + specialty_los + specialty_ed) + plot_annotation(title = "Activity and LOS by Specialty")
+
+
+
+
+
+top_5_specs <- imds_data2 %>%
+  count(discharge_specialty, sort=T) %>%
+  slice(1:5)
 
 ## Plot activity over the same period
 ## Plot admission activity
