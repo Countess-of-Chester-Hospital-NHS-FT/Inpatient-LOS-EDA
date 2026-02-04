@@ -1,0 +1,484 @@
+---
+title: "Emergency Inpatient Length of Stay"
+author: "COCH Data & Analytics Team"
+date: today
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-float: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+## Setup, import and wrangling
+
+### Libraries
+```{r}
+#| label: import-libraries
+library(tidyverse)
+library(janitor)
+library(finalfit)
+library(zoo)
+library(slider)
+library(patchwork)
+library(scales)
+library(knitr)
+
+theme_set(theme_bw())
+```
+
+### Global variables
+```{r}
+refresh_data <- FALSE
+
+### Globals
+sdec_frailty_esc <- ymd("20250801")
+sdec_esc_coch <- ymd("20250301")
+sdec_corridor_esc <- ymd("20250901")
+mh_max <- ymd("20251001")
+nctr_start <- ymd("20230401")
+```
+
+### Import from database
+```{r}
+if (refresh_data == TRUE) {
+  db <- DBI::dbConnect(odbc::odbc(), "coch_p2")
+  imds_data <-  DBI::dbGetQuery(db, "
+   with last_epi as (
+    select
+  	  ENCNTR_ID
+  	  ,luspec.Specialty as [DischargeSpecialty]
+    from CernerStaging.[BI].[InpatientMDS] imds
+    left join [InformationDB].[dbo].[LuSpecialtyDivision] luspec on luspec.TreatCode = imds.SpecialtyFunctionCode
+    where LastEpisodeOfSpellIndicator = 1
+    )
+  
+    , nctr_first as (
+    select 
+  	  ENCNTR_ID
+  	  ,interval_start_dt
+    from InformationSandpitDB.dbo.NCTR_Intervals
+    where asc_interval_seq = 1
+    )
+  
+    , eph_first as (
+    select
+  	  ENCNTR_ID
+  	  ,WardStartDateTime
+  	  ,row_number() over (partition by ENCNTR_ID order by WardStartDateTime) [RN]
+    from CernerStaging.BI.IP_Ward_Stays
+    where LocationName like '%EPH%'
+    )
+    
+    select
+  	imds.ENCNTR_ID
+  	,ENCNTR_SLICE_ID
+  	,LocalPatientIdentifier
+  	,AdmissionDate
+  	,DischargeDate
+  	,datediff(hour, AdmissionDate, DischargeDate) / 24.0 [LOS_Days]
+  		,CASE WHEN AdmissionMethodCode like '1%' THEN 'Elective'
+  			WHEN AdmissionMethodCode like '2%' THEN 'Emergency'
+  			WHEN AdmissionMethodCode like '3%' THEN 'Maternity'
+  			WHEN AdmissionMethodCode like '8%' THEN 'Other'
+  			ELSE AdmissionMethodCode
+  		END AS [AdmissionMethod]
+  	,CASE WHEN PatientClassification = '1' THEN 'Ordinary'
+  		WHEN PatientClassification = '2' THEN 'Day case'
+  		WHEN PatientClassification = '3' THEN 'Regular day'
+  		WHEN PatientClassification = '4' THEN 'Regular night'
+  		WHEN PatientClassification = '5' THEN 'Delivery facilities only'
+  		ELSE PatientClassification
+  		END AS [PatientClassification]
+  	,CASE WHEN IntendedManagementCode = '1' THEN 'Overnight'
+  		WHEN IntendedManagementCode = '2' THEN 'Day case'
+  		WHEN IntendedManagementCode = '3' THEN 'Sequence (day and night)'
+  		WHEN IntendedManagementCode = '4' THEN 'Sequence (day)'
+  		WHEN IntendedManagementCode = '5' THEN 'Sequence (night only)'
+  		WHEN IntendedManagementCode = '8' THEN 'NA'
+  		WHEN IntendedManagementCode = '9' THEN 'Unknown'
+  		ELSE IntendedManagementCode
+  		END AS [IntendedManagementCode]
+  	,luspec.Specialty as [AdmissionSpecialty]
+  	,last_epi.DischargeSpecialty
+  	,PrimaryDiagnosis
+  	,icd10.[DESCRIPTION] as [PrimaryDiagnosisDesc]
+  	,PrimaryProcedure
+  	,opcs.OperationCategory as [PrimaryProcedureDesc]
+  	,nctr_first.interval_start_dt [FirstNCTRDate]
+  	,eph_first.WardStartDateTime [FirstEPH]
+  from CernerStaging.[BI].[InpatientMDS] imds
+  left join [InformationDB].[dbo].[LuSpecialtyDivision] luspec on luspec.TreatCode = imds.SpecialtyFunctionCode
+  left join LoadRef.TRUD.OPCS4_10 opcs on opcs.OperationCode = imds.PrimaryProcedure COLLATE DATABASE_DEFAULT
+  left join LoadRef.TRUD.ICD10 icd10 on icd10.ALT_CODE = imds.PrimaryDiagnosis COLLATE DATABASE_DEFAULT
+  left join last_epi on imds.ENCNTR_ID = last_epi.ENCNTR_ID
+  left join nctr_first on nctr_first.ENCNTR_ID = imds.ENCNTR_ID
+  left join eph_first on eph_first.ENCNTR_ID = imds.ENCNTR_ID and eph_first.RN = 1
+  where 1=1
+  	and EpisodeNumber = 1
+  order by AdmissionDate desc                  
+                                ") |>
+    clean_names()
+  
+  ed_data <-  DBI::dbGetQuery(db,
+                              "select 
+                              ENCNTR_ID
+                              ,TrackingHours
+                              ,CheckInDateTime
+                              ,CheckOutDateTime
+                              ,InpatientAdmitDateTime_Encounter
+                              ,Discharge_Destination_Mnemonic
+                              from CernerStaging.[BI].[ECDS_Attendances]"
+                              ) |>
+    clean_names()
+  
+  saveRDS(imds_data, "data\\imds_data.rds")
+  saveRDS(ed_data, "data\\ed_data.rds")
+  
+}
+```
+
+### Import from file
+```{r}
+#| label: import-from-file
+#| output: false
+
+imds_data <- readRDS("data\\imds_data.rds")
+ed_data <- readRDS("data\\ed_data.rds")
+```
+
+### Data Wrangling
+```{r}
+#| label: wrangle-data
+#| output: false
+
+imds_data2 <- imds_data |>
+  rename(admission_datetime = admission_date,
+         discharge_datetime = discharge_date) |>
+  mutate(admission_date = date(admission_datetime),
+         discharge_date = date(discharge_datetime),
+         eph_date = pmin(date(first_eph), discharge_date, na.rm = TRUE),
+         nctr_date = pmin(date(first_nctr_date), discharge_date, na.rm = TRUE),
+         eph_nctr_date = pmin(eph_date, nctr_date, discharge_date, na.rm = TRUE),
+         los_hrs = admission_datetime%--%discharge_datetime / hours(1),
+         mh_days = admission_date%--%discharge_date / days(1),
+         los_no_eph = admission_date%--%eph_date / days(1),
+         los_ctr = admission_date%--%nctr_date / days(1),
+         los_nctr = nctr_date%--%discharge_date / days(1),
+         los_nctr2 = if_else(is.na(los_nctr), 0, los_nctr),
+         los_no_eph_nctr = admission_date%--%eph_nctr_date / days(1),
+         discharge_month = floor_date(discharge_date, "month"),
+         admission_month = floor_date(admission_date, "month"),
+         not_discharged = if_else(is.na(discharge_datetime), 1, 0)) |>
+  filter(
+    admission_method == "Emergency",
+    (mh_days > 1 | is.na(mh_days)),
+    !patient_classification %in% c('Regular day', 'Regular night'),
+    discharge_date >= ymd("20210801"),
+    discharge_date < floor_date(today(), "month")
+    ) |>
+  left_join(ed_data, by = c("encntr_id"="encntr_id"))
+```
+
+### Missing Data Summary
+```{r}
+#| label: tbl-missing
+#| tbl-cap: "Summary of missingness"
+
+missing <- missing_glimpse(imds_data2) |>
+  as_tibble() |>
+  select(label, n, missing_n, missing_percent)
+
+kable(missing)
+```
+
+## Analysis and Visuals
+
+### Overall Inpatient Length of Stay
+
+#### Summary table - overall inpatient length of stay
+```{r}
+#| label: tbl-inpatient-los
+#| tbl-cap: "Inpatient los metrics aggregated by month"
+
+plot_data <- imds_data2 |>
+  group_by(discharge_month) |>
+  summarise(n = n(),
+            incomplete = sum(not_discharged),
+            mean_los = mean(mh_days, na.rm = T),
+            mean_no_eph = mean(los_no_eph, na.rm = T),
+            mean_ctr = mean(los_ctr, na.rm = T),
+            mean_nctr = mean(los_nctr, na.rm = T),
+            mean_no_eph_nctr = mean(los_no_eph_nctr, na.rm = T),
+            mean_ed = mean(tracking_hours, na.rm = T)
+  ) |>
+  ungroup() |>
+  mutate(rolling_6mn_avg = zoo::rollmean(mean_los, k = 6, fill = NA, align = "right"),
+         rolling_adm_avg = zoo::rollmean(n, k = 6, fill = NA, align = "right"),
+         rolling_no_eph = zoo::rollmean(mean_no_eph, k = 6, fill = NA, align = "right"),
+         rolling_ctr = zoo::rollmean(mean_ctr, k = 6, fill = NA, align = "right"),
+         rolling_nctr = zoo::rollmean(mean_nctr, k = 6, fill = NA, align = "right"),
+         rolling_no_eph_nctr = zoo::rollmean(mean_no_eph_nctr, k = 6, fill = NA, align = "right"),
+         rolling_ed = zoo::rollmean(mean_ed, k = 6, fill = NA, align = "right")
+  ) |>
+  mutate(mean_ctr = if_else(discharge_month < nctr_start, NA, mean_ctr),
+         mean_nctr = if_else(discharge_month < nctr_start, NA, mean_nctr),
+         rolling_ctr = if_else(discharge_month < nctr_start, NA, rolling_ctr),
+         rolling_nctr = if_else(discharge_month < nctr_start, NA, rolling_nctr)
+         )
+
+kable(plot_data, digits = 2)
+```
+
+#### Plot - overall inpatient length of stay
+```{r}
+#| label: fig-inpatient-los
+#| fig-cap: "Trend in inpatient length of stay over time"
+
+max_month <- max(plot_data$discharge_month)
+
+## Recreate MH plot - trimmed + trend
+los_model <- lm(mean_los ~ discharge_month, data = plot_data)
+yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
+latest <- plot_data |> filter(discharge_month == max(plot_data$discharge_month)) |> pull(rolling_6mn_avg)
+
+los_plot <- plot_data |>
+  ggplot(aes(x = discharge_month)) +
+  geom_rect(xmin = mh_max, xmax = max(plot_data$discharge_month), ymin = -Inf, ymax = Inf,
+            fill = "gold", alpha = 0.01, inherit.aes = FALSE) +
+  annotate("label",
+           x = mh_max + months(1),
+           y = 14,
+           label = "New") +
+  annotate("label",
+           x = ymd("20230801"),
+           y = 14,
+           label = "On Model Hospital") +
+  
+  geom_line(aes(y = rolling_6mn_avg, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_los), method = "lm") +
+  geom_line(aes(y = mean_los, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_los, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_6mn_avg, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean LOS (Days)",
+       title = "Mean Emergency Inpatient LOS (Rolling 6 months)",
+       subtitle = paste("Latest Mean: ", round(latest, 1),
+                        "Trend :", round(yearly_increase, 1), "days per year"))
+
+los_plot
+```
+
+#### Plot - Trends in CTR/NCTR
+```{r}
+#| label: fig-ctr-nctr
+#| fig-cap: "Trend in CTR/NCTR length of stay over time"
+#| fig-asp: 1
+#| fig-width: 7
+
+
+los_model <- lm(mean_ctr ~ discharge_month, data = plot_data)
+yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
+latest <- plot_data |> filter(discharge_month == max(plot_data$discharge_month)) |> pull(rolling_ctr)
+
+ctr_plot <- plot_data |>
+  ggplot(aes(x = discharge_month)) +
+  geom_rect(xmin = mh_max, xmax = max(plot_data$discharge_month), ymin = -Inf, ymax = Inf,
+            fill = "gold", alpha = 0.01, inherit.aes = FALSE) +
+  geom_line(aes(y = rolling_ctr, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_ctr), method = "lm") +
+  geom_line(aes(y = mean_ctr, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_ctr, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_ctr, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean LOS (Days)",
+       title = "Mean CTR LOS (Rolling 6 months)",
+       subtitle = paste("Latest Mean: ", round(latest, 1),
+                        "Trend :", round(yearly_increase, 1), "days per year")) +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "none"
+  )
+
+los_model <- lm(mean_nctr ~ discharge_month, data = plot_data)
+yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
+latest <- plot_data |> filter(discharge_month == max_month) |> pull(rolling_nctr)
+
+nctr_plot <- plot_data |>
+  ggplot(aes(x = discharge_month)) +
+  geom_rect(xmin = mh_max, xmax = max(plot_data$discharge_month), ymin = -Inf, ymax = Inf,
+            fill = "gold", alpha = 0.01, inherit.aes = FALSE) +
+  geom_line(aes(y = rolling_nctr, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_nctr), method = "lm") +
+  geom_line(aes(y = mean_nctr, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_nctr, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_nctr, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean LOS (Days)",
+       title = "Mean NCTR LOS (Rolling 6 months)",
+       subtitle = paste("Latest Mean: ", round(latest, 1),
+                        "Trend :", round(yearly_increase, 1), "days per year"))
+
+
+(ctr_plot / nctr_plot)
+```
+
+#### Plot - Admission Delays
+```{r}
+#| label: fig-admission-delay
+#| fig-cap: "Trend in admission delays over time"
+
+los_model <- lm(mean_ed ~ discharge_month, data = plot_data)
+yearly_increase <- coef(los_model)["discharge_month"] * 365 #convert coef from daily to monthly
+latest <- plot_data |> filter(discharge_month == max_month) |> pull(rolling_ed)
+
+ed_plot <- plot_data |>
+  ggplot(aes(x = discharge_month)) +
+  geom_rect(xmin = mh_max, xmax = max_month, ymin = -Inf, ymax = Inf,
+            fill = "gold", alpha = 0.01, inherit.aes = FALSE) +
+  
+  geom_line(aes(y = rolling_ed, color = "Rolling 6-month average")) +
+  geom_smooth(aes(y = mean_ed), method = "lm") +
+  geom_line(aes(y = mean_ed, color = "Actual average"),
+            alpha = 0.5) +
+  geom_point(aes(y = mean_ed, color = "Actual average"),
+             alpha = 0.5) +
+  geom_point(aes(y = rolling_ed, color = "Rolling 6-month average")) +
+  scale_x_date(
+    date_breaks = "3 months",      
+    date_labels = "%b %Y"          
+  ) +
+  scale_color_manual(
+    name = NULL, # No title for the color legend
+    values = c(
+      "Rolling 6-month average" = "black",
+      "Actual average" = "grey50")
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(x = NULL,
+       y = "Mean Admission Delay (Hours)",
+       title = "Mean Admission Delay (Rolling 6 months)",
+       subtitle = paste("Latest Mean: ", round(latest, 1),
+                        "Trend :", round(yearly_increase, 1), "hours per year"))
+
+ed_plot
+```
+
+#### Plot - Specialty Summary
+```{r}
+#| label: fig-specialty-summary
+#| fig-cap: "Comparison of los in different specialties"
+
+specialty_summary <- imds_data2 |>
+  filter(discharge_month <= max(plot_data$discharge_month),
+         discharge_month >= min(nctr_start)) |>
+  group_by(discharge_specialty) |>
+  summarise(n = n(),
+            mean_los = mean(mh_days, na.rm = T),
+            mean_ctr = mean(los_ctr, na.rm = T),
+            mean_ed = mean(tracking_hours, na.rm = T)) |>
+  mutate(mean_nctr = mean_los - mean_ctr) |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
+  filter(!discharge_specialty == "Other")
+
+
+specialty_activity <- specialty_summary |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |> 
+  filter(!discharge_specialty == "Other") |>
+  ggplot(aes(x = discharge_specialty, y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL)
+
+specialty_los <- specialty_summary |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
+  filter(!discharge_specialty == "Other") |>
+  pivot_longer(
+    cols = c(mean_ctr, mean_nctr), 
+    names_to = "los_type", 
+    values_to = "los_value"
+  ) |>
+  mutate(los_type = factor(los_type, levels = c("mean_ctr", "mean_nctr"))) |>
+  ggplot(aes(x = discharge_specialty, y = los_value, fill = fct_rev(los_type))) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Mean LoS (Days)",
+       fill = "LoS Type") +
+  theme(
+    axis.text.y = element_blank(),
+    legend.position = "bottom"
+  )
+
+## specialty entrance block
+specialty_ed <- specialty_summary |>
+  mutate(discharge_specialty = fct_lump_n(discharge_specialty, n = 18, w = n, other_level = "Other")) |>
+  mutate(discharge_specialty = fct_explicit_na(discharge_specialty, na_level = "Other")) |>
+  mutate(discharge_specialty = fct_reorder(discharge_specialty, n, .desc = F)) |>
+  filter(!discharge_specialty == "Other") |>
+  ggplot(aes(x = discharge_specialty, y = mean_ed)) +
+  geom_col() +
+  #geom_boxplot()+
+  coord_flip() +
+  labs(x = NULL,
+       y = "Mean Admission Delay (Hours)"
+       ) +
+  theme(
+    axis.text.y = element_blank()
+  )
+
+(specialty_activity + specialty_los + specialty_ed) + plot_annotation(title = "Activity and LOS by Specialty")
+```
+
+
