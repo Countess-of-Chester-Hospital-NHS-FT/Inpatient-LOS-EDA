@@ -97,9 +97,9 @@ ed_data <-  DBI::dbGetQuery(db,
                             from CernerStaging.[BI].[ECDS_Attendances]"
                             )
 
-#saveRDS(imds_data, "data\\imds_data.rds")
-#saveRDS(ed_data, "data\\ed_data.rds")
-imds_data <- readRDS("data\\imds_data.rds") #for offline
+saveRDS(imds_data, "data\\imds_data.rds")
+saveRDS(ed_data, "data\\ed_data.rds")
+#imds_data <- readRDS("data\\imds_data.rds") #for offline
 
 imds_data2 <- imds_data |>
   clean_names() |>
