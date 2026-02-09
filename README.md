@@ -13,7 +13,8 @@ Note: No data are shared in this repo.
 ### Project Structure
 
 * The main code is found in the root of the repo
-* los.qmd is the primary code file containing the visuals that typically need repeating
+* los.qmd is the primary code file containing the length of stay summary visuals that typically need repeating
+* amu_flow.qmd is the primary code file containing the analysis of admission delays of ED vs SDEC
 * eda1.R and eda2.R are untidy code files, remnants of development
 
 
