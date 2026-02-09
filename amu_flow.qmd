@@ -1,0 +1,232 @@
+---
+title: "Emergency Inpatient Length of Stay"
+author: "COCH Data & Analytics Team"
+date: today
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-float: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+## Setup, import and wrangling
+
+### Libraries
+```{r}
+#| label: import-libraries
+library(tidyverse)
+library(janitor)
+library(finalfit)
+library(zoo)
+library(slider)
+library(patchwork)
+library(scales)
+library(knitr)
+library(glue)
+source("observation_functions.R")
+
+theme_set(theme_bw())
+```
+
+### Global variables
+```{r}
+ward_list <- list('AMU COCH')
+#ward_list <- list('SDEC Frailty Esc COCH', 'SDEC Corridor Escalation COCH',
+                  #'SDEC ESC COCH')
+start_date <- ymd("20251201")
+this_week_start <- floor_date(today(), unit = "week")
+```
+
+### Import from database
+```{r}
+db <- DBI::dbConnect(odbc::odbc(), "coch_p2")
+
+df_ed <- DBI::dbGetQuery(db, glue_sql("
+                      select
+ecds.ENCNTR_ID
+,ecds.LocalPatientIdentifier
+,lumpi.Sex
+,Patient_Age_At_Activity
+,CheckInDateTime
+,DATEDIFF(minute, CheckInDateTime, DecisionToAdmitDateTime) / 60.0 [CheckInToDTAHrs]
+,DecisionToAdmitDateTime
+,DATEDIFF(minute, DecisionToAdmitDateTime, WardStartDateTime) / 60.0 [DTAToWardStartHrs]
+,TrackingHours
+,WardStartDateTime as [AMU_arrival_time]
+,ROW_NUMBER() over (partition by ecds.ENCNTR_ID order by WardStartDateTime) as [RN]
+from CernerStaging.BI.IP_Ward_Stays ws
+inner join CernerStaging.[BI].[ECDS_Attendances] ecds on ecds.ENCNTR_ID = ws.ENCNTR_ID
+left join [CernerStaging].[BI].[LuMPI] lumpi on lumpi.hospitalNumber = ecds.LocalPatientIdentifier
+where 1=1
+	and LocationName in ({ward_list*})
+	and WardStartDateTime > {start_date}
+	and WardSeqID = 1
+                      
+                      ", .con = db)) |>
+  clean_names()
+
+df_sdec <- DBI::dbGetQuery(db, glue_sql("
+                     select
+ENCNTR_ID
+,Hospital_Number
+,lumpi.Sex
+,Age_At_Admission
+,coalesce(ED_CheckInDateTime, First_SDEC_WardStartDateTime) [ArrivalTime]
+,datediff(minute, coalesce(ED_CheckInDateTime, First_SDEC_WardStartDateTime), Last_SDEC_WardEndDate) / 60.0 [TrackingHours]
+,Last_SDEC_WardEndDate [AMU_arrival_time]
+from InformationSandpitDB.[Reports].[pbi_SDEC_inpatients] sdec
+left join [CernerStaging].[BI].[LuMPI] lumpi on lumpi.hospitalNumber = sdec.Hospital_Number
+where 1=1
+	and Post_SDEC_Location in ({ward_list*})
+	and Last_SDEC_WardEndDate > {start_date}
+                      
+                      ", .con = db)) |>
+  clean_names()
+
+# Create comma-separated strings for the IDs
+ids_ed <- glue::glue_collapse(df_ed$encntr_id, sep = ",")
+ids_sdec <- glue::glue_collapse(df_sdec$encntr_id, sep = ",")
+
+df_obs <- DBI::dbGetQuery(db, str_glue("
+                                       select
+	ENCNTR_ID
+	,ValidFromDateTime
+	,RespiratoryRate
+	,SpO2
+	,OxygenTherapy
+	,SystolicBloodPressure
+	,HeartRateMonitored
+	,AcvpuConsciousLevel
+	,coalesce(Temperature, TemperatureAxillary, TemperatureTympanic) [Temperature]
+	,ROW_NUMBER() over (partition by ENCNTR_ID order by ValidFromDateTime) [RN]
+from CernerStaging.BI.EarlyWarningScoreIview
+where ENCNTR_ID in ({ids_ed}) or ENCNTR_ID in ({ids_sdec})
+                                       ")) |>
+  clean_names()
+```
+
+### Wrangle Observation Data
+```{r}
+#selects the first complete set of observations per encounter
+df_obs2 <- df_obs |>
+  mutate(complete = ifelse(if_all(3:9, ~ !is.na(.)), 1, 0)) |>
+  filter(complete == 1) |>
+  group_by(encntr_id) |>
+  mutate(rn2 = row_number(valid_from_date_time)) |>
+  ungroup() |>
+  filter(rn2 == 1)
+
+#calculates and interprets news score
+df_obs3 <- df_obs2 %>%
+  calculate_news_score() %>%
+  interpret_news_score()
+
+#selects just the columns for joining
+df_obs4 <- df_obs3 |>
+  select(encntr_id, news_score, clinical_risk)
+```
+
+### wrangle attendance data
+```{r}
+# selects just the columns needed for histograms
+df_ed_hist <- df_ed |>
+  select(encntr_id, tracking_hours, patient_age_at_activity, amu_arrival_time) |>
+  rename(age = patient_age_at_activity) |>
+  mutate(route = "ED")
+
+# joins ED and SDEC admissions into the same table
+df_hist <- df_sdec |>
+  select(encntr_id, tracking_hours, age_at_admission, amu_arrival_time) |>
+  rename(age = age_at_admission) |>
+  mutate(route = "SDEC") |>
+  bind_rows(df_ed_hist) |>
+  left_join(df_obs4) |>
+  filter(tracking_hours < 100) # apply DQ limit
+```
+
+## Analysis and Visuals
+
+### Summary table
+```{r}
+df_summary <- df_hist |>
+  group_by(route) |>
+  summarise(n = n(),
+            median_hrs = median(tracking_hours),
+            mean = mean(tracking_hours),
+            median_age = median(age),
+            mean_age = mean(age),
+            median_news = median(news_score, na.rm = TRUE),
+            mean_news = mean(news_score, na.rm = TRUE))
+
+kable(df_summary)
+```
+
+```{r}
+missing <- missing_glimpse(df_summary)
+
+kable(missing)
+```
+
+## Analysis and Visuals
+
+### ED Admission Delays to AMU
+```{r}
+df_hist |> 
+  filter(route == "ED") |>
+  ggplot(aes(x = tracking_hours, fill = route)) +
+  geom_histogram(alpha = 0.5, position = "identity") +
+  labs(title = str_glue("Admission Delay since {start_date}"),
+       x = "Hours from arrival")
+```
+
+```{r}
+df_hist |>
+  mutate(admission_week = floor_date(amu_arrival_time, unit = "week")) |>
+  filter(route == "ED",
+         admission_week < this_week_start) |>
+  ggplot(aes(x = tracking_hours, fill = route)) +
+  geom_histogram(alpha = 0.5, position = "identity") +
+  facet_wrap(~admission_week, nrow = 3) + 
+  labs(title = str_glue("Admission Delay from ED since {start_date}"),
+       subtitle = str_glue("{ward_list}"),
+       x = "Hours from arrival")
+```
+
+
+```{r}
+df_hist |> 
+  mutate(admission_week = floor_date(amu_arrival_time, unit = "week")) |>
+  filter(route == "ED",
+         admission_week < this_week_start) |>
+  ggplot(aes(x = tracking_hours, fill = route)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~admission_week, nrow = 3) + 
+  labs(title = str_glue("Admission Delay ED from ED since {start_date}"),
+       x = "Hours from arrival") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)))
+```
+
+
+
+### Admission Delays ED vs SDEC
+```{r}
+df_hist |> 
+  #filter(route == "ED") |>
+  ggplot(aes(x = tracking_hours, fill = route)) +
+  geom_histogram(alpha = 0.5, position = "identity") +
+  labs(title = "Admission Delay ED vs SDEC",
+       x = "Hours from arrival")
+
+df_hist |> 
+  ggplot(aes(x = tracking_hours, fill = route)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = df_summary$median_hrs, linetype = "dashed") +
+  labs(title = "Admission Delay ED vs SDEC",
+       x = "Hours from arrival") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)))
+```
+
+
